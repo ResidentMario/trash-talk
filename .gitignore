@@ -2,3 +2,6 @@
 .DS_Store
 .idea/
 data/
+_map.html
+__pycache__/
+src/garbageman.egg-info
