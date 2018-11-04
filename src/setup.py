@@ -1,7 +1,7 @@
 from setuptools import setup
 setup(
-    name = 'garbageman',
-    packages = ['garbageman'], # this must be the same as the name above
+    name='garbageman',
+    packages=['garbageman'],
     install_requires=['matplotlib', 'pandas', 'geopandas', 'rtree', 'tqdm'],
     py_modules=['pipeline', 'utils'],
     version='0.0.1',
