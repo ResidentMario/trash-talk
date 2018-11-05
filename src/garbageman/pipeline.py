@@ -32,7 +32,9 @@ def join_bldgs_blocks(buildings, blocks, building_id_key="sf16_BldgID"):
         according to the data given).
     """
     #logger.info("Geospatial join of buildings and blocks in progress.")
-    all_matches = gpd.sjoin(buildings, blocks, how="left", op='intersects')
+    all_matches = (gpd.sjoin(buildings, blocks, how="left", op='intersects')
+                   .rename(columns={'index_right': 'index_block'})
+                   .set_index("index"))
     matches = all_matches.groupby(building_id_key).filter(lambda df: len(df) == 1).reset_index()
     multimatches = all_matches.groupby(building_id_key).filter(lambda df: len(df) > 1).reset_index()
     nonmatches = all_matches[pd.isnull(all_matches['index_right'])]
@@ -106,11 +108,14 @@ def blockfaces_for_block(block):
 
 
 def drop_noncontiguous_blocks(blocks):
-    """
-    Remove all blocks in the list of blocks which are composed of multiple geometries. This unusual case is the result
-    of the inclusion of island features in the census blocks covering a city.
-    """
     return blocks[blocks.geometry.map(lambda g: isinstance(g.buffer(0), Polygon))]
+
+
+def blockfaces_for_blocks(blocks):
+    contiguous_blocks = drop_noncontiguous_blocks(blocks)
+    blockfaces = pd.concat(contiguous_blocks.apply(lambda b: blockfaces_for_block(b), axis='columns').values)
+    blockfaces = blockfaces.drop(columns=['simplified_geometry'])  # write compatibility
+    return blockfaces
 
 
 def build_streets_geospatial_index(streets):
