@@ -51,9 +51,9 @@ def join_bldgs_blocks(buildings, blocks, building_id_key="sf16_BldgID"):
     return matches, multimatches, nonmatches
 
 
-def simplify(shp, tol=0.05):
+def _simplify(shp, tol=0.05):
     """
-    Generate a simplified shape for shp, within a 5 percent tolerance.
+    Generate a simplified shape for shp, within a specified tolerance.
 
     Used for blockface alignment.
     """
@@ -66,12 +66,31 @@ def simplify(shp, tol=0.05):
     return simp
 
 
-def blockfaces_for_block(block):
+def blockfaces_for_block(block, tol=0.05):
     """
-    Generate a GeoDataFrame of block faces from a block definition.
+    Given a `block` footprint as a geometry, returns a breakdown of that block into individual blockface segments.
+
+    We pass a simplification algorithm over the block geometry and examine the points which survive in order to
+    determine which points are geometrically important to the block geometry. These points form the boundaries of the
+    blockfaces we partition the block into. Points not included in the simplified geometry become intermediate points
+    along the blockface boundary.
+
+    Parameters
+    ----------
+    block: gpd.GeoSeries
+        Data for a single block.
+    tol: float
+        The maximum simplification threshold. Blockfaces will be determined using a simplified representation of the
+        block with at most this much inaccuracy with respect to the "real thing". Higher tolerances result in fewer but
+        more complex blockfaces. Value is a float ratio out of 1.
+
+    Returns
+    -------
+    out: gpd.GeoDataFrame
+        Data and geometries corresponding with each blockface.
     """
     orig = block.geometry.buffer(0)  # MultiPolygon -> Polygon
-    simp = simplify(orig)
+    simp = _simplify(orig, tol=tol)
 
     orig_coords = mapping(orig)['coordinates'][0]
     simp_coords = mapping(simp)['coordinates'][0]
@@ -101,6 +120,7 @@ def blockfaces_for_block(block):
     from shapely.geometry import LineString
 
     # frame id, block id, original geometry, and simplified geometry
+    # TODO: allow arbitrary ID fields.
     for n, (simp_blockface_coord_seq, orig_blockface_coord_seq) in enumerate(zip(simp_out, orig_out)):
         blockface_num = n + 1
         out.append({
@@ -115,20 +135,42 @@ def blockfaces_for_block(block):
     return out
 
 
-def drop_noncontiguous_blocks(blocks):
+def _drop_noncontiguous_blocks(blocks):
+    """
+    Removes geometries from a `GeoDataFrame` input that are not polygonal, e.g. consist of multiple shapes. This is
+    used to exclude discontiguous blocks from the data, e.g. island formations.
+    """
     return blocks[blocks.geometry.map(lambda g: isinstance(g.buffer(0), Polygon))]
 
 
-def blockfaces_for_blocks(blocks):
-    contiguous_blocks = drop_noncontiguous_blocks(blocks)
-    blockfaces = pd.concat(contiguous_blocks.apply(lambda b: blockfaces_for_block(b), axis='columns').values)
+def blockfaces_for_blocks(blocks, tol=0.05):
+    """
+    Given `blocks` footprint data, returns a breakdown of those block into individual blockface segments.
+
+    For implementation details see `blockfaces_for_block`, which this method calls.
+
+    Parameters
+    ----------
+    blocks: gpd.GeoDataFrame
+        Data for
+    tol: float
+        The maximum simplification threshold. Higher values result in fewer but more complex blockfaces. C.f.
+        `blockfaces_for_block`.
+
+    Returns
+    -------
+    out: gpd.GeoDataFrame
+        Data and geometries for each blockface of each block.
+    """
+    contiguous_blocks = _drop_noncontiguous_blocks(blocks)
+    blockfaces = pd.concat(contiguous_blocks.apply(lambda b: blockfaces_for_block(b, tol=tol), axis='columns').values)
     blockfaces = blockfaces.drop(columns=['simplified_geometry'])  # write compatibility
     return blockfaces
 
 
-def build_streets_geospatial_index(streets):
+def street_index(streets):
     """
-    Create a geospatial index of streets using the RTree package. Input to `find_matching_street`, which uses this
+    Create a geospatial index of streets using the `rtree` package. Helper to `find_matching_street`, which uses this
     index to perform the actual join.
     """
     import rtree
@@ -143,13 +185,33 @@ def build_streets_geospatial_index(streets):
 
 def find_matching_street(blockface, streets, index):
     """
-    Finds the street that matches a blockface. May have multiple results or zero results.
+    Finds the street that matches a blockface. Outputs zero to many hits.
+
+    Most street segments contain subsegments which are close matches to blockface segments, but there is floating point
+    arithmetic error and measurement error that keeps the match from being one hundred percent correct. To find matches
+    we first use a spatial index to narrow down to near hits. Then we buffer the street segment geometrically (creating
+    a polygon) and check if the buffered segment contains the blockface (or vice versa). Matches occur wherever this
+    hueristic evaluates to True.
+
+    Parameters
+    ----------
+    blockface: gpd.GeoSeries
+        Data for a single blockface.
+    streets: gpd.GeoDataFrame
+        Data for streets in the area of interest.
+    index: rtree.index.Index
+        A geospatial index for streets, as created with `street_index`.
+
+    Returns
+    -------
+    None or gpd.GeoDataFrame
+        None if no matches are found. Otherwise, data for each street matching the given blockface.
     """
     def n_nearest_streets(block, mult=2):
         """
-        Returns a frame of streets nearest the given block. mult controls how many times more
-        streets will be looked up than the block has sides; because we need to return a lot of
-        results, just to make sure we get every street fronting the block.
+        Returns a frame of streets nearest the given block. mult controls how many times more streets will be looked up
+        than the block has sides; because we need to return a lot of results, just to make sure we get every street
+        fronting the block.
         """
         x, y = block.geometry.envelope.exterior.coords.xy
         n = (len(x) - 1) * 2
@@ -168,11 +230,27 @@ def find_matching_street(blockface, streets, index):
         return gpd.GeoDataFrame(sub_matches)
 
 
-# TODO: parameterize the join key
 def merge_street_segments_blockfaces_blocks(blockfaces, streets, index):
     """
-    Matches street segments to blockfaces
+    Matches street segments to blockfaces, and returns a concatenated data representation thereof.
+
+    See `find_matching_street` for implementation details.
+
+    Parameters
+    ----------
+    blockface: gpd.GeoSeries
+        Data for blockfaces of interest.
+    streets: gpd.GeoDataFrame
+        Data for streets in the area of interest.
+    index: rtree.index.Index
+        A geospatial index for streets, as created with `street_index`.
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Data on each match found.
     """
+    # TODO: parameterize the join key
     matches = []
 
     for idx, blockface in tqdm(blockfaces.iterrows()):
@@ -197,6 +275,10 @@ def merge_street_segments_blockfaces_blocks(blockfaces, streets, index):
 
 
 def filter_on_block_id(block_id, block_id_key="geoid10"):
+    """
+    Helper factory function. Returns a function which may be applied to a chunk of data to select on an ID. Used by
+    `get_block_data`.
+    """
     def select(df):
         return (df.set_index(block_id_key)
                 .filter(like=block_id, axis='rows')
@@ -207,29 +289,43 @@ def filter_on_block_id(block_id, block_id_key="geoid10"):
 
 
 def get_block_data(block_id, street_segments, blockfaces, buildings):
+    """
+    Given a block ID and a set of data inputs, returns a tuple of filtered data objects containing only matches on that
+    ID.
+
+    Parameters
+    ----------
+    block_id: str
+        A unique ID for a block, which is expected to appear in all of the other inputs (this will only be true if you
+        have already performed all of the requisite geospatial joins).
+    street_segments, gpd.GeoDataFrame
+        Street data.
+    blockfaces, gpd.GeoDataFrame
+        Blockface data.
+    buildings, gpd.GeoDataFrame
+        Building data.
+
+    Returns
+    -------
+    tuple
+        The corresponding filtered set of data.
+    """
     ss = street_segments.pipe(filter_on_block_id(block_id))
     bf = blockfaces.pipe(filter_on_block_id(block_id))
     bldgs = buildings.pipe(filter_on_block_id(block_id))
     return ss, bf, bldgs
 
 
-def plot_block(block_id):
-    street_segments, blockfaces, buildings = get_block_data(block_id)
-
-    ax = street_segments.plot(color='red', linewidth=1)
-    blockfaces.plot(color='black', ax=ax, linewidth=1)
-    buildings.plot(ax=ax, color='lightsteelblue', linewidth=1, edgecolor='steelblue')
-    return ax
-
-
-def simplify_linestring(inp):
+def simplify_linestring(inp, decimals=4):
+    """Helper function that simplifies a Linestring down to a certain precision. Not currently used."""
     inp = inp.convex_hull
-    coords = np.round(mapping(inp)['coordinates'], decimals=4)
+    coords = np.round(mapping(inp)['coordinates'], decimals=decimals)
     out = LineString(coords)
     return out
 
 
 def simplify_bldg(bldg):
+    """Helper function that simplifies a Polygon down to a certain precision. Not currently used."""
     if isinstance(bldg, MultiPolygon):
         bldg = bldg.buffer(0)
 
@@ -242,11 +338,14 @@ def simplify_bldg(bldg):
     return bldg
 
 
-def pairwise_combinations(keys):
-    return itertools.combinations({'a': 12, 'b': 15, 'c': 13}.keys(), r=2)
-
-
 def collect_strides(point_observations):
+    """
+    Given a sequence of observations of which building is nearest to points on a shape (expressed as a percentage
+    length out of 1), collects those observations into contiguous strides, thereby assigning buildings to chunks of the
+    shape.
+
+    Internal method to `frontages_for_blockfaces`.
+    """
     point_obs_keys = list(point_observations.keys())
     curr_obs_start_offset = point_obs_keys[0]
     curr_obs_start_bldg = point_observations[point_obs_keys[0]]
@@ -262,11 +361,15 @@ def collect_strides(point_observations):
             continue
 
     strides[(curr_obs_start_offset, '1.00')] = bldg_observed
-
     return strides
 
 
 def get_stride_boundaries(strides, step_size=0.02):
+    """
+    Given a sequence of strides as returned by `collect_strides`, determines boundary areas of inaccuracies.
+
+    Internal method to `frontages_for_blockfaces`.
+    """
     boundaries = list()
 
     keys = list(strides.keys())
@@ -278,7 +381,9 @@ def get_stride_boundaries(strides, step_size=0.02):
 
 
 def cut(line, distance):
-    # Cuts a line in two at a distance from its starting point
+    """
+    Cuts a line in two at a distance from its starting point. Helper function.
+    """
     if distance <= 0.0 or distance >= 1.0:
         return [LineString(line)]
     coords = list(line.coords)
@@ -296,12 +401,19 @@ def cut(line, distance):
 
 
 def reverse(l):
+    """
+    Reverses LineString coordinates. Also known as changing the "winding direction" of the geometry. Helper function.
+    """
     l_x, l_y = l.coords.xy
     l_x, l_y = l_x[::-1], l_y[::-1]
     return LineString(zip(l_x, l_y))
 
 
 def chop_line_segment_using_offsets(line, offsets):
+    """
+    Cuts a line into offset segments. Helper function.
+    """
+    # TODO: fix this function.
     offset_keys = list(offsets.keys())
     out = []
 
@@ -311,8 +423,8 @@ def chop_line_segment_using_offsets(line, offsets):
 
         # Reverse to cut off the start.
         out_line = reverse(out_line)
-        out_line = cut(out_line, 1 - float(off_start))
-        out_line = reverse(out_line)
+        left, right = cut(out_line, 1 - float(off_start))
+        out_line = reverse(left)
         intermediate_length = out_line.length
 
         # Calculate the new cutoff end point, and apply it to the line.
@@ -321,9 +433,10 @@ def chop_line_segment_using_offsets(line, offsets):
         new_off_end = l_1_2 - l_1_3
 
         # Perform the cut.
-        out_line = cut(out_line, new_off_end)
+        left, right = cut(out_line, new_off_end)
+        out_line = left
 
-        if cut_result is None:
+        if out_line is None:
             return np.nan
         elif len(cut_result) == 1:
             out.append(cut_result[0])
@@ -335,6 +448,7 @@ def chop_line_segment_using_offsets(line, offsets):
 
 
 def frontages_for_blockface(bldgs, blockface, step_size=0.01):
+    # TODO: docstring
     index = rtree.Rtree()
 
     if len(bldgs) == 0:

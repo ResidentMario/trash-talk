@@ -1,6 +1,5 @@
-# import matplotlib.pyplot as plt
-# import pandas as pd
 import numpy as np
+from .pipeline import get_block_data
 
 
 def plot_building_block_multimatch(multimatches, blocks, building_id_key="sf16_BldgID", id_value=None):
@@ -82,13 +81,26 @@ def plot_building_block_nonmatch():
     pass
 
 
+# TODO
 def plot_building_block_nonmatches():
     pass
+
 
 # TODO
 def plot_unmatched_blockface():
     pass
 
+
 # TODO
 def plot_unmatched_blockfaces():
     pass
+
+
+# TODO: docstring etcetera
+def plot_block(block_id, street_segments, blockfaces, buildings):
+    street_segments, blockfaces, buildings = get_block_data(block_id, street_segments, blockfaces, buildings)
+
+    ax = street_segments.plot(color='red', linewidth=1)
+    blockfaces.plot(color='black', ax=ax, linewidth=1)
+    buildings.plot(ax=ax, color='lightsteelblue', linewidth=1, edgecolor='steelblue')
+    return ax
