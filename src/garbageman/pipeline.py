@@ -332,7 +332,6 @@ def simplify_bldg(bldg):
     if isinstance(bldg, MultiPolygon):
         raise NotImplemented  # TODO
 
-    coords = [xyz[:2] for xyz in mapping(bldg.convex_hull)['coordinates'][0]]
     bldg = Polygon(bldg)
 
     return bldg
@@ -383,21 +382,24 @@ def get_stride_boundaries(strides, step_size=0.02):
 def cut(line, distance):
     """
     Cuts a line in two at a distance from its starting point. Helper function.
+
+    Modified version of algorithm found at http://toblerity.org/shapely/manual.html#object.project.
     """
-    if distance <= 0.0 or distance >= 1.0:
-        return [LineString(line)]
+    if distance == 0.0:
+        return LineString()
+    elif distance == 1.0:
+        return LineString(line)
+    elif distance < 0.0 or distance > 1.0:
+        raise ValueError("Cannot cut a line using a ratio outside the range [0, 1]")
+
     coords = list(line.coords)
     for i, p in enumerate(coords):
         pd = line.project(Point(p), normalized=True)
         if pd == distance:
-            return [
-                LineString(coords[:i + 1]),
-                LineString(coords[i:])]
+            return LineString(coords[:i + 1])
         if pd > distance:
             cp = line.interpolate(distance, normalized=True)
-            return [
-                LineString(coords[:i] + [(cp.x, cp.y)]),
-                LineString([(cp.x, cp.y)] + coords[i:])]
+            return LineString(coords[:i] + [(cp.x, cp.y)])
 
 
 def reverse(l):
@@ -413,7 +415,6 @@ def chop_line_segment_using_offsets(line, offsets):
     """
     Cuts a line into offset segments. Helper function.
     """
-    # TODO: fix this function.
     offset_keys = list(offsets.keys())
     out = []
 
@@ -423,26 +424,18 @@ def chop_line_segment_using_offsets(line, offsets):
 
         # Reverse to cut off the start.
         out_line = reverse(out_line)
-        left, right = cut(out_line, 1 - float(off_start))
-        out_line = reverse(left)
-        intermediate_length = out_line.length
+        out_line = cut(out_line, 1 - float(off_start))
+        out_line = reverse(out_line)
 
         # Calculate the new cutoff end point, and apply it to the line.
         l_1_2 = (float(off_end) - float(off_start)) * orig_length
         l_1_3 = (1 - float(off_start)) * orig_length
-        new_off_end = l_1_2 - l_1_3
+        new_off_end = l_1_2 / l_1_3
 
         # Perform the cut.
-        left, right = cut(out_line, new_off_end)
-        out_line = left
+        out_line = cut(out_line, new_off_end)
 
-        if out_line is None:
-            return np.nan
-        elif len(cut_result) == 1:
-            out.append(cut_result[0])
-        else:
-            to_out, rest = cut(line, float(off_end))
-            out.append(to_out)
+        out.append(np.nan if out_line is None else out_line)
 
     return out
 
@@ -485,3 +478,20 @@ def frontages_for_blockface(bldgs, blockface, step_size=0.01):
     out['geometry'] = geoms
 
     return out
+
+
+def calculate_frontages(blocks, streets, blockfaces, buildings):
+    # TODO: undo hard-code on the ID.
+    frontages = []
+
+    for block_idx, block in tqdm(list(blocks.iterrows())):
+        _, blockfaces, buildings = get_block_data(block.geoid10, streets, blockfaces, buildings)
+        for blockface_idx, blockface in blockfaces.iterrows():
+            result = frontages_for_blockface(buildings, blockface)
+            frontages.append(result)
+
+    frontages = gpd.GeoDataFrame(pd.concat(frontages)).groupby('sf16_BldgID').apply(
+        lambda df: df.assign(sf16_BldgID_n=[f'{df.iloc[0].sf16_BldgID}_{n}' for n in range(len(df))])
+    ).reset_index(drop=True)
+
+    return frontages
