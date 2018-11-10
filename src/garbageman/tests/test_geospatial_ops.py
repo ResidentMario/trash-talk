@@ -42,7 +42,7 @@ class TestReverse(unittest.TestCase):
         assert garbageman.pipeline.reverse(garbageman.pipeline.reverse(line)).equals(line)
 
 
-class TestSegmentation(unittest.TestCase):
+class TestChopLineSegmentsUsingOffsets(unittest.TestCase):
     def test(self):
         f = garbageman.pipeline.chop_line_segment_using_offsets
         line = LineString(((0, 0), (1, 0)))
