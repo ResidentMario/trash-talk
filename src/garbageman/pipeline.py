@@ -2,8 +2,9 @@ import pandas as pd
 import numpy as np
 import geopandas as gpd
 import logging
-from shapely.geometry import Polygon, mapping
+from shapely.geometry import Polygon, LineString, MultiPolygon, Point, mapping
 from tqdm import tqdm
+import rtree
 
 # TODO
 logger = logging.getLogger('garbageman')
@@ -11,18 +12,25 @@ logger = logging.getLogger('garbageman')
 
 def join_bldgs_blocks(buildings, blocks, building_id_key="sf16_BldgID"):
     """
-    Performs a geospatial join, attempting to geometrically assign buildings to specific blocks.
+    Performs a geo-spatial join on buildings and blocks. Each of the `buildings` searches for `blocks` that it
+    intersects with. In a good case, the building is found to be located within a particular block. In a bad case, the
+    building is found to match with no blocks (if the space it is located on seemingly isn't included in `blocks`) or
+    with many blocks (if its footprint intersects with more than one block).
+
+    This function therefore returns a tuple of three items: `matches` for buildings uniquely joined to blocks,
+    `multimatches` for buildings joined to multiple blocks, a `nonmatches` for buildings joined to no blocks.
 
     Parameters
     ----------
     buildings: gpd.GeoDataFrame
-        A tabular `GeoDataFrame` whose `geometry` corresponds with all buildings in the area of interest.
+        A tabular `GeoDataFrame` whose `geometry` consists of building footprints in the area of interest.
 
     blocks: gpd.GeoDataFrame
-        A tabular `GeoDataFrame` whose `geometry` corresponds with all blocks in the area of interest.
+        A tabular `GeoDataFrame` whose `geometry` corresponds with all block footprints in the area of interest.
 
     building_id_key: str, default "sf16_BldgID"
-        The key corresponding with the building ID.
+        A unique ID for the buildings. This field must be present in the `buildings` dataset, and it must be uniquely
+        keyed.
 
     Returns
     -------
@@ -31,7 +39,7 @@ def join_bldgs_blocks(buildings, blocks, building_id_key="sf16_BldgID"):
         element is buildings that span multiple blocks, and the third is buildings that span no blocks (at least
         according to the data given).
     """
-    #logger.info("Geospatial join of buildings and blocks in progress.")
+    # logger.info("Geospatial join of buildings and blocks in progress.")
     all_matches = (gpd.sjoin(buildings, blocks, how="left", op='intersects')
                    .rename(columns={'index_right': 'index_block'})
                    .set_index("index"))
@@ -186,3 +194,180 @@ def merge_street_segments_blockfaces_blocks(blockfaces, streets, index):
     street_segments = pd.concat(matches_merge)
     del matches_merge
     return street_segments
+
+
+def filter_on_block_id(block_id, block_id_key="geoid10"):
+    def select(df):
+        return (df.set_index(block_id_key)
+                .filter(like=block_id, axis='rows')
+                .reset_index()
+                )
+
+    return select
+
+
+def get_block_data(block_id, street_segments, blockfaces, buildings):
+    ss = street_segments.pipe(filter_on_block_id(block_id))
+    bf = blockfaces.pipe(filter_on_block_id(block_id))
+    bldgs = buildings.pipe(filter_on_block_id(block_id))
+    return ss, bf, bldgs
+
+
+def plot_block(block_id):
+    street_segments, blockfaces, buildings = get_block_data(block_id)
+
+    ax = street_segments.plot(color='red', linewidth=1)
+    blockfaces.plot(color='black', ax=ax, linewidth=1)
+    buildings.plot(ax=ax, color='lightsteelblue', linewidth=1, edgecolor='steelblue')
+    return ax
+
+
+def simplify_linestring(inp):
+    inp = inp.convex_hull
+    coords = np.round(mapping(inp)['coordinates'], decimals=4)
+    out = LineString(coords)
+    return out
+
+
+def simplify_bldg(bldg):
+    if isinstance(bldg, MultiPolygon):
+        bldg = bldg.buffer(0)
+
+    if isinstance(bldg, MultiPolygon):
+        raise NotImplemented  # TODO
+
+    coords = [xyz[:2] for xyz in mapping(bldg.convex_hull)['coordinates'][0]]
+    bldg = Polygon(bldg)
+
+    return bldg
+
+
+def pairwise_combinations(keys):
+    return itertools.combinations({'a': 12, 'b': 15, 'c': 13}.keys(), r=2)
+
+
+def collect_strides(point_observations):
+    point_obs_keys = list(point_observations.keys())
+    curr_obs_start_offset = point_obs_keys[0]
+    curr_obs_start_bldg = point_observations[point_obs_keys[0]]
+    strides = dict()
+
+    for point_obs in point_obs_keys[1:]:
+        bldg_observed = point_observations[point_obs]
+        if bldg_observed != curr_obs_start_bldg:
+            strides[(curr_obs_start_offset, point_obs)] = curr_obs_start_bldg
+            curr_obs_start_offset = point_obs
+            curr_obs_start_bldg = bldg_observed
+        else:
+            continue
+
+    strides[(curr_obs_start_offset, '1.00')] = bldg_observed
+
+    return strides
+
+
+def get_stride_boundaries(strides, step_size=0.02):
+    boundaries = list()
+
+    keys = list(strides.keys())
+    for idx, key in enumerate(keys[1:]):
+        curr = strides[key]
+        boundaries.append((key[0], str(float(key[0]) + step_size)))
+
+    return boundaries
+
+
+def cut(line, distance):
+    # Cuts a line in two at a distance from its starting point
+    if distance <= 0.0 or distance >= 1.0:
+        return [LineString(line)]
+    coords = list(line.coords)
+    for i, p in enumerate(coords):
+        pd = line.project(Point(p), normalized=True)
+        if pd == distance:
+            return [
+                LineString(coords[:i + 1]),
+                LineString(coords[i:])]
+        if pd > distance:
+            cp = line.interpolate(distance, normalized=True)
+            return [
+                LineString(coords[:i] + [(cp.x, cp.y)]),
+                LineString([(cp.x, cp.y)] + coords[i:])]
+
+
+def reverse(l):
+    l_x, l_y = l.coords.xy
+    l_x, l_y = l_x[::-1], l_y[::-1]
+    return LineString(zip(l_x, l_y))
+
+
+def chop_line_segment_using_offsets(line, offsets):
+    offset_keys = list(offsets.keys())
+    out = []
+
+    for off_start, off_end in offset_keys:
+        out_line = LineString(line.coords)
+        orig_length = out_line.length
+
+        # Reverse to cut off the start.
+        out_line = reverse(out_line)
+        out_line = cut(out_line, 1 - float(off_start))
+        out_line = reverse(out_line)
+        intermediate_length = out_line.length
+
+        # Calculate the new cutoff end point, and apply it to the line.
+        l_1_2 = (float(off_end) - float(off_start)) * orig_length
+        l_1_3 = (1 - float(off_start)) * orig_length
+        new_off_end = l_1_2 - l_1_3
+
+        # Perform the cut.
+        out_line = cut(out_line, new_off_end)
+
+        if cut_result is None:
+            return np.nan
+        elif len(cut_result) == 1:
+            out.append(cut_result[0])
+        else:
+            to_out, rest = cut(line, float(off_end))
+            out.append(to_out)
+
+    return out
+
+
+def frontages_for_blockface(bldgs, blockface, step_size=0.01):
+    index = rtree.Rtree()
+
+    if len(bldgs) == 0:
+        return gpd.GeoDataFrame()
+
+    for idx, bldg in bldgs.iterrows():
+        index.insert(idx, bldg.geometry.bounds)
+
+    bldg_frontage_points = dict()
+
+    search_space = np.arange(0, 1, step_size)
+    next_search_space = []
+    while len(search_space) > 0:
+        for offset in search_space:
+            search_point = blockface.geometry.interpolate(offset, normalized=True)
+            nearest_bldg = list(index.nearest(search_point.bounds, 1))[0]
+            bldg_frontage_points[str(offset)[:6]] = nearest_bldg
+
+        strides = collect_strides(bldg_frontage_points)
+        search_space = next_search_space
+
+    # convert the list of strides to a proper GeoDataFrame
+    out = []
+    for sk in strides.keys():
+        srs = bldgs.loc[strides[sk], ['geoid10', 'sf16_BldgID']]
+        srs['geoid10_n'] = blockface['geoid10_n']
+        srs['geom_offset_start'] = sk[0]
+        srs['geom_offset_end'] = sk[1]
+        out.append(srs)
+
+    out = gpd.GeoDataFrame(out)
+
+    geoms = chop_line_segment_using_offsets(blockface.geometry, strides)
+    out['geometry'] = geoms
+
+    return out
