@@ -531,13 +531,33 @@ def calculate_frontages(blocks, streets, blockfaces, buildings):
     frontages = []
 
     for block_idx, block in tqdm(list(blocks.iterrows())):
-        _, blockfaces, buildings = get_block_data(block.geoid10, streets, blockfaces, buildings)
-        for blockface_idx, blockface in blockfaces.iterrows():
-            result = frontages_for_blockface(buildings, blockface)
+        _, blockface_targets, building_targets = get_block_data(block.geoid10, streets, blockfaces, buildings)
+        for _, blockface_target in blockface_targets.iterrows():
+            result = frontages_for_blockface(building_targets, blockface_target)
             frontages.append(result)
 
-    frontages = gpd.GeoDataFrame(pd.concat(frontages)).groupby('sf16_BldgID').apply(
-        lambda df: df.assign(sf16_BldgID_n=[f'{df.iloc[0].sf16_BldgID}_{n}' for n in range(len(df))])
-    ).reset_index(drop=True)
+    frontages = gpd.GeoDataFrame(pd.concat([f for f in frontages if len(f) > 0]))
+    if len(frontages) == 0:
+        return frontages
+    else:
+        return frontages.groupby('sf16_BldgID').apply(
+            lambda df: df.assign(sf16_BldgID_n=[f'{df.iloc[0].sf16_BldgID}_{n}' for n in range(len(df))])
+        ).reset_index(drop=True)
 
-    return frontages
+
+def select_area_of_interest(blocks, poly):
+    """Select all blocks that touch the given boundaries. Utility function."""
+    return blocks[blocks.geometry.map(lambda block: poly.contains(block))]
+
+
+def frontage_index(frontages):
+    """
+    Create a geospatial index of frontages using the `rtree` package.
+    """
+    import rtree
+    index = rtree.index.Index()
+
+    for idx, frontage in frontages.iterrows():
+        index.insert(idx, frontage.bounds)
+
+    return index
