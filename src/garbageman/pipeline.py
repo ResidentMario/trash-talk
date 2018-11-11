@@ -168,7 +168,7 @@ def blockfaces_for_blocks(blocks, tol=0.05):
     return blockfaces
 
 
-def street_index(streets):
+def create_index(srs):
     """
     Create a geospatial index of streets using the `rtree` package. Helper to `find_matching_street`, which uses this
     index to perform the actual join.
@@ -176,9 +176,8 @@ def street_index(streets):
     import rtree
     index = rtree.index.Index()
 
-    for idx, street in streets.iterrows():
-        x, y = street.geometry.envelope.exterior.coords.xy
-        index.insert(idx, (min(x), min(y), max(x), max(y)))
+    for idx, feature in srs.iterrows():
+        index.insert(idx, feature.geometry.bounds)
 
     return index
 
@@ -200,7 +199,7 @@ def find_matching_street(blockface, streets, index):
     streets: gpd.GeoDataFrame
         Data for streets in the area of interest.
     index: rtree.index.Index
-        A geospatial index for streets, as created with `street_index`.
+        A geospatial index for streets, as created with `create_index`.
 
     Returns
     -------
@@ -243,7 +242,7 @@ def merge_street_segments_blockfaces_blocks(blockfaces, streets, index):
     streets: gpd.GeoDataFrame
         Data for streets in the area of interest.
     index: rtree.index.Index
-        A geospatial index for streets, as created with `street_index`.
+        A geospatial index for streets, as created with `create_index`.
 
     Returns
     -------
@@ -550,14 +549,29 @@ def select_area_of_interest(blocks, poly):
     return blocks[blocks.geometry.map(lambda block: poly.contains(block))]
 
 
-def frontage_index(frontages):
-    """
-    Create a geospatial index of frontages using the `rtree` package.
-    """
-    import rtree
-    index = rtree.index.Index()
+def distance(line, point):
+    """Returns the distance between a line and a point."""
+    proj_pos = line.project(point, normalized=True)
+    proj_point = line.interpolate(proj_pos, normalized=True)
+    dist = proj_point.distance(point)
+    return dist
 
-    for idx, frontage in frontages.iterrows():
-        index.insert(idx, frontage.bounds)
 
-    return index
+def assign_points_to_frontages(points, frontages, index):
+    """
+    Given a sequence of `points` and of `frontages` and a geospatial `index` on `frontages`, assigns points to
+    frontages in the dataset.
+    """
+    idxs = points.geometry.map(lambda g: list(index.nearest(g.bounds, 5)))
+    frontage_groups = idxs.map(lambda idx_group: frontages.iloc[idx_group]).values
+
+    out = []
+    for i in range(len(points)):
+        point = points.iloc[i]
+        frontage_group = frontage_groups[i]
+
+        distances = [distance(frontage.geometry, point.geometry) for _, frontage in frontage_group.iterrows()]
+        frontage_idx = np.argmin(distances)
+        out.append(frontages.iloc[frontage_group.index[frontage_idx]])
+
+    return pd.concat(out, axis='columns').T.sf16_BldgID_n

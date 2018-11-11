@@ -1,5 +1,5 @@
 import unittest
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 import numpy as np
 
 import sys; sys.path.append("../")
@@ -62,3 +62,21 @@ class TestChopLineSegmentsUsingOffsets(unittest.TestCase):
             exp_boundary = np.round(expected[i].coords[0][0], decimals=2)
             key_boundary = float(offset_keys[i][0])
             assert exp_boundary == key_boundary
+
+
+class TestNearestDistance(unittest.TestCase):
+    def testMidpoint(self):
+        f = garbageman.pipeline.distance
+        line = LineString(((0, 0), (2, 0)))
+        point = Point(1, 1)
+        assert f(line, point) == 1
+
+    def testTouching(self):
+        f = garbageman.pipeline.distance
+        line = LineString(((0, 0), (2, 0)))
+
+        point = Point(1, 0)
+        assert f(line, point) == 0
+
+        point = Point(2, 0)
+        assert f(line, point) == 0
